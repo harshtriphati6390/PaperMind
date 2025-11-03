@@ -1,0 +1,362 @@
+
+AI Paper Analyzer
+-----------------
+A self-contained Tkinter app that:
+- Loads PDF or TXT/MD files
+- Extracts text (PyPDF2)
+- Processes with spaCy (keyword extraction, NER, sentences)
+- Uses OpenAI API for: summary, question generation, criticial improvements, checklist/rubric
+- Displays results in a scrollable UI and allows saving a report (markdown)
+
+Requirements:
+- Python 3.10+
+- pip install openai spacy PyPDF2 python-dotenv tkscrolledframe
+- python -m spacy download en_core_web_sm
+
+Usage: set OPENAI_API_KEY in environment or a .env file
+
+NOTES:
+- This script is intended as a starting point and minimal production hardening is applied (e.g., basic error handling).
+- You can adapt prompt templates and model parameters to your account and needs.
+
+"""
+
+import os
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
+from pathlib import Path
+import textwrap
+import json
+
+try:
+    import openai
+except Exception as e:
+    openai = None
+
+try:
+    import spacy
+except Exception as e:
+    spacy = None
+
+try:
+    import PyPDF2
+except Exception as e:
+    PyPDF2 = None
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# ---------- Configuration and helper functions ----------
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+if OPENAI_KEY:
+    if openai:
+        openai.api_key = OPENAI_KEY
+
+# Default model and params (tune as you like)
+OPENAI_MODEL = "gpt-4o-mini" if openai else "gpt-4o-mini"
+OPENAI_TIMEOUT = 60
+
+PROMPTS = {
+    "summary": (
+        "You are a helpful research assistant. Provide a concise, structured summary of the paper. "
+        "Include: Objective, Methods, Key Results, Conclusions, and 2-sentence takeaways. Keep under 200 words.\n\nPaper Text:\n"),
+    "questions": (
+        "You are an expert researcher. Based on the following paper, produce:\n"
+        "1) Five high-quality discussion questions suitable for a graduate seminar (open-ended).\n"
+        "2) Five targeted reviewer questions that check reproducibility and clarity (short).\n"
+        "Format as JSON with keys 'discussion' and 'review'.\n\nPaper Text:\n"),
+    "improvements": (
+        "You are a senior reviewer. Suggest 8 concrete, actionable improvements to strengthen the paper: "
+        "cover clarity, experiments, baselines, presentation, reproducibility, and writing. Provide short ('what') and concrete ('how') items as JSON list of { 'what':..., 'how':... }.\n\nPaper Text:\n"),
+    "checklist": (
+        "Produce a concise review checklist (10 items max) for this paper focused on: Novelty, Reproducibility, Baselines, Significance, Clarity. Return as numbered list.\n\nPaper Text:\n"),
+}
+
+
+def extract_text_from_pdf(path: Path) -> str:
+    if PyPDF2 is None:
+        raise RuntimeError("PyPDF2 not installed")
+    text_parts = []
+    with open(path, 'rb') as f:
+        reader = PyPDF2.PdfReader(f)
+        for p in range(len(reader.pages)):
+            try:
+                page = reader.pages[p]
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+            except Exception:
+                continue
+    return "\n\n".join(text_parts)
+
+
+def load_spacy_model():
+    global nlp
+    if spacy is None:
+        raise RuntimeError("spaCy not installed")
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except Exception:
+        # attempt to download - note: user must have network access
+        from spacy.cli import download
+        download("en_core_web_sm")
+        nlp = spacy.load("en_core_web_sm")
+    return nlp
+
+
+def extract_spacy_insights(text: str, n_top_keywords=12):
+    if not text.strip():
+        return {}
+    nlp = load_spacy_model()
+    doc = nlp(text[:200000])  # limit for performance
+    # Named Entities
+    entities = [(ent.text, ent.label_) for ent in doc.ents]
+    # Keywords (simple heuristic: frequent non-stop nouns / proper nouns)
+    words = [token.lemma_.lower() for token in doc if token.is_alpha and not token.is_stop]
+    freq = {}
+    for w in words:
+        freq[w] = freq.get(w, 0) + 1
+    sorted_kw = sorted(freq.items(), key=lambda x: x[1], reverse=True)
+    keywords = [k for k, _ in sorted_kw[:n_top_keywords]]
+    # Top sentences by length+position heuristics (very rough):
+    sents = [s.text.strip() for s in doc.sents if len(s.text.strip()) > 20]
+    top_sents = sents[:5]
+
+    return {
+        "entities": entities,
+        "keywords": keywords,
+        "top_sentences": top_sents,
+        "word_count": len(words)
+    }
+
+
+def call_openai(prompt: str, system_prompt: str = None, temperature=0.2, max_tokens=600):
+    if openai is None:
+        raise RuntimeError("openai package not installed")
+    full_prompt = prompt
+    try:
+        # Use ChatCompletion (assistant style)
+        response = openai.ChatCompletion.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt or "You are a helpful assistant."},
+                {"role": "user", "content": full_prompt}
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=OPENAI_TIMEOUT,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"[OpenAI Error] {str(e)}"
+
+
+# ---------- Tkinter UI ----------
+
+class PaperAnalyzerApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("AI Paper Analyzer")
+        self.geometry("1000x700")
+        self.filepath = None
+        self.paper_text = ""
+        self.create_widgets()
+
+    def create_widgets(self):
+        top_frame = tk.Frame(self)
+        top_frame.pack(fill=tk.X, padx=8, pady=8)
+
+        load_btn = tk.Button(top_frame, text="Load PDF / TXT", command=self.load_file)
+        load_btn.pack(side=tk.LEFT)
+
+        analyze_btn = tk.Button(top_frame, text="Analyze", command=self.on_analyze)
+        analyze_btn.pack(side=tk.LEFT, padx=6)
+
+        save_btn = tk.Button(top_frame, text="Save Report", command=self.save_report)
+        save_btn.pack(side=tk.LEFT, padx=6)
+
+        settings_btn = tk.Button(top_frame, text="Settings", command=self.open_settings)
+        settings_btn.pack(side=tk.LEFT, padx=6)
+
+        self.status_label = tk.Label(top_frame, text="Ready")
+        self.status_label.pack(side=tk.RIGHT)
+
+        # Left: Inputs / Metadata
+        left_frame = tk.Frame(self)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=8)
+        left_frame.config(width=320)
+
+        tk.Label(left_frame, text="Paper / Input Text", font=(None, 10, 'bold')).pack(anchor='w')
+        self.input_text = ScrolledText(left_frame, height=20, width=40)
+        self.input_text.pack(fill=tk.BOTH, expand=False)
+
+        tk.Label(left_frame, text="Prompt hints (optional):").pack(anchor='w', pady=(6,0))
+        self.prompt_entry = tk.Entry(left_frame)
+        self.prompt_entry.pack(fill=tk.X)
+
+        # Right: Output
+        right_frame = tk.Frame(self)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        tk.Label(right_frame, text="Analysis Output", font=(None, 10, 'bold')).pack(anchor='w')
+        self.output_text = ScrolledText(right_frame)
+        self.output_text.pack(fill=tk.BOTH, expand=True)
+
+    def load_file(self):
+        fp = filedialog.askopenfilename(filetypes=[("PDF files","*.pdf"), ("Text files","*.txt;*.md"), ("All","*.*")])
+        if not fp:
+            return
+        self.filepath = Path(fp)
+        try:
+            if self.filepath.suffix.lower() == '.pdf':
+                text = extract_text_from_pdf(self.filepath)
+            else:
+                text = self.filepath.read_text(encoding='utf-8', errors='ignore')
+            self.paper_text = text
+            # Put first chunk in input_text
+            self.input_text.delete('1.0', tk.END)
+            self.input_text.insert(tk.END, text[:20000])
+            self.status_label.config(text=f"Loaded: {self.filepath.name}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load file: {e}")
+
+    def on_analyze(self):
+        # Read text from input box (user may have pasted)
+        text = self.input_text.get('1.0', tk.END).strip()
+        if not text:
+            messagebox.showinfo("No input", "Paste or load a paper first.")
+            return
+        self.paper_text = text
+        # Run analysis in a thread to keep UI responsive
+        t = threading.Thread(target=self.run_analysis, daemon=True)
+        t.start()
+
+    def run_analysis(self):
+        self.set_status("Analyzing...")
+        try:
+            # 1) spaCy insights
+            try:
+                spacy_insights = extract_spacy_insights(self.paper_text)
+            except Exception as e:
+                spacy_insights = {"error": str(e)}
+
+            # 2) Short summary via OpenAI
+            short_prompt = PROMPTS['summary'] + self.paper_text[:40000]
+            user_hint = self.prompt_entry.get().strip()
+            if user_hint:
+                short_prompt = user_hint + "\n\n" + short_prompt
+
+            try:
+                summary = call_openai(short_prompt, temperature=0.2, max_tokens=300)
+            except Exception as e:
+                summary = f"[Summary Error] {e}"
+
+            # 3) Questions
+            q_prompt = PROMPTS['questions'] + self.paper_text[:30000]
+            try:
+                questions_raw = call_openai(q_prompt, temperature=0.4, max_tokens=800)
+            except Exception as e:
+                questions_raw = f"[Questions Error] {e}"
+
+            # 4) Improvements
+            imp_prompt = PROMPTS['improvements'] + self.paper_text[:30000]
+            try:
+                improvements_raw = call_openai(imp_prompt, temperature=0.4, max_tokens=700)
+            except Exception as e:
+                improvements_raw = f"[Improvements Error] {e}"
+
+            # 5) Checklist
+            chk_prompt = PROMPTS['checklist'] + self.paper_text[:30000]
+            try:
+                checklist_raw = call_openai(chk_prompt, temperature=0.1, max_tokens=300)
+            except Exception as e:
+                checklist_raw = f"[Checklist Error] {e}"
+
+            # Collate output
+            lines = []
+            lines.append("=== Summary ===\n")
+            lines.append(summary + "\n\n")
+            lines.append("=== spaCy Insights ===\n")
+            try:
+                if 'error' in spacy_insights:
+                    lines.append(f"spaCy error: {spacy_insights['error']}\n\n")
+                else:
+                    lines.append(f"Word count (approx): {spacy_insights.get('word_count')}\n")
+                    lines.append("Keywords: " + ', '.join(spacy_insights.get('keywords', [])) + "\n")
+                    ent_lines = '\n'.join([f"{t} [{l}]" for t, l in spacy_insights.get('entities', [])[:25]])
+                    lines.append("Entities:\n" + ent_lines + "\n\n")
+                    lines.append("Top sentences:\n" + '\n'.join(spacy_insights.get('top_sentences', [])) + "\n\n")
+            except Exception:
+                lines.append(str(spacy_insights) + "\n\n")
+
+            lines.append("=== Generated Questions (raw) ===\n")
+            lines.append(questions_raw + "\n\n")
+
+            lines.append("=== Improvements (raw) ===\n")
+            lines.append(improvements_raw + "\n\n")
+
+            lines.append("=== Review Checklist ===\n")
+            lines.append(checklist_raw + "\n\n")
+
+            # Update UI
+            self.output_text.delete('1.0', tk.END)
+            self.output_text.insert(tk.END, ''.join(lines))
+            self.set_status("Analysis complete")
+        except Exception as e:
+            self.set_status("Error")
+            messagebox.showerror("Analysis error", str(e))
+
+    def save_report(self):
+        content = self.output_text.get('1.0', tk.END).strip()
+        if not content:
+            messagebox.showinfo("No output", "Run analysis first to generate a report.")
+            return
+        fp = filedialog.asksaveasfilename(defaultextension='.md', filetypes=[('Markdown','*.md'), ('Text','*.txt')])
+        if not fp:
+            return
+        try:
+            Path(fp).write_text(content, encoding='utf-8')
+            messagebox.showinfo('Saved', f'Report saved to {fp}')
+        except Exception as e:
+            messagebox.showerror('Save failed', str(e))
+
+    def open_settings(self):
+        SettingsWindow(self)
+
+    def set_status(self, text: str):
+        def inner():
+            self.status_label.config(text=text)
+        self.after(0, inner)
+
+
+class SettingsWindow(tk.Toplevel):
+    def __init__(self, parent: PaperAnalyzerApp):
+        super().__init__(parent)
+        self.title('Settings')
+        self.geometry('420x200')
+        tk.Label(self, text='OpenAI Model').pack(anchor='w', padx=8, pady=(8,0))
+        self.model_var = tk.StringVar(value=OPENAI_MODEL)
+        tk.Entry(self, textvariable=self.model_var).pack(fill=tk.X, padx=8)
+
+        tk.Label(self, text='OpenAI Temperature (0-1)').pack(anchor='w', padx=8, pady=(8,0))
+        self.temp_var = tk.DoubleVar(value=0.2)
+        tk.Entry(self, textvariable=self.temp_var).pack(fill=tk.X, padx=8)
+
+        tk.Button(self, text='Save', command=self.save).pack(pady=12)
+
+    def save(self):
+        global OPENAI_MODEL
+        try:
+            OPENAI_MODEL = self.model_var.get().strip() or OPENAI_MODEL
+        except Exception:
+            pass
+        self.destroy()
+
+
+# ---------- Run App ----------
+
+if __name__ == '__main__':
+    app = PaperAnalyzerApp()
+    app.mainloop()
